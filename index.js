@@ -112,7 +112,10 @@ function throttledToast(level, key, message, title = 'ST-Saver') {
 // 必须在任何 relayFetch 调用前抓取 native fetch，否则我们自己后面会包它
 const originalFetch = window.fetch;
 
-const RELAY_TIMEOUT_MS = 8000;
+// 中转处理大聊天（46-78MB）需要时间：拉磁盘 + JSON parse + diff + stringify + 写磁盘
+// 8 秒只够中等聊天，大聊天会超时被误判为"中转挂了"。
+// 60 秒兼容超大聊天的同时仍能合理失败兜底。
+const RELAY_TIMEOUT_MS = 60_000;
 
 const relayState = {
     healthy: false,
@@ -169,7 +172,7 @@ async function checkRelayHealth(force = false) {
  * 中转自己持有酒馆 cookie + csrf（启动时调 GET /csrf-token 取得），
  * 浏览器/扩展无需透传任何认证信息，简单干净。
  *
- * @param {*} _originalHeaders  保留参数槽位以备后续用，当前忽略
+ * @param {*} [_originalHeaders]  保留参数槽位以备后续用，当前忽略
  */
 function buildForwardHeaders(_originalHeaders) {
     return { 'Content-Type': 'application/json' };
@@ -224,6 +227,69 @@ function resolveCurrentIdentity() {
 function clearSession() {
     if (currentSession) logRelay('session cleared:', currentSession.sessionKey);
     currentSession = null;
+}
+
+/**
+ * 主动从中转拉基线 hashes（CHAT_CHANGED 时调用）。
+ * 这样第一次保存就能直接走增量，不再需要"首次走全量上传"。
+ *
+ * 流量：仅传 hashes 数组（1878 行 × 14 字符 ≈ 26KB），远小于聊天本身的几十 MB。
+ */
+async function initBaselineFromRelay() {
+    const settings = getSettings();
+    if (!settings.relayEnabled) return null;
+
+    const resolved = resolveCurrentIdentity();
+    if (!resolved) {
+        logRelay('initBaseline: no identity yet, skip');
+        return null;
+    }
+
+    const ok = await checkRelayHealth(false);
+    if (!ok) {
+        logRelay('initBaseline: relay unhealthy, skip (next save will fall back)');
+        return null;
+    }
+
+    const sessionKey = buildSessionKey(resolved.kind, resolved.identity);
+    const body = {
+        kind: resolved.kind,
+        ...resolved.identity,
+    };
+
+    let res;
+    try {
+        res = await relayFetch('/sync/init', {
+            method: 'POST',
+            headers: buildForwardHeaders(),
+            body: JSON.stringify(body),
+        });
+    } catch (err) {
+        logRelay('initBaseline: fetch failed:', err?.message);
+        return null;
+    }
+
+    if (!res.ok) {
+        logRelay('initBaseline: relay returned', res.status);
+        return null;
+    }
+
+    const json = await res.json().catch(() => null);
+    if (!json || !Array.isArray(json.hashes) || !json.baselineFingerprint) {
+        logRelay('initBaseline: malformed response');
+        return null;
+    }
+
+    currentSession = {
+        sessionKey,
+        kind: resolved.kind,
+        identity: resolved.identity,
+        lastSyncedHashes: json.hashes,
+        baselineFingerprint: json.baselineFingerprint,
+        inited: true,
+    };
+    logRelay(`initBaseline: ok sessionKey=${sessionKey} len=${json.length} fp=${json.baselineFingerprint}`);
+    return currentSession;
 }
 
 
@@ -895,11 +961,27 @@ $(document).ready(function () {
     updateButtonState();
     resetTimer('plugin initialized');
 
-    // 切换聊天 → 清空当前 session，下次保存时按需重建
+    // 启动时如果已经在某个聊天里，主动建立基线（CHAT_CHANGED 在加载完成前已经触发过）
+    setTimeout(() => {
+        if (!currentSession) {
+            initBaselineFromRelay().catch(err => {
+                console.error('[ST-Saver] initial initBaselineFromRelay error:', err);
+            });
+        }
+    }, 1500);  // 等酒馆完全加载
+
+    // 切换聊天 → 清空当前 session，主动建立新基线
+    // 让第一次保存就能直接走增量（不再"首次走全量上传"）
     if (eventSource && event_types?.CHAT_CHANGED) {
         eventSource.on(event_types.CHAT_CHANGED, () => {
             clearSession();
-            // 不主动 init，第一次拦截到 saveChat 时再初始化 + 走全量
+            // 异步去拉基线，不阻塞酒馆界面
+            // 拉不到也没事，下次保存会自动 fallback 到原版全量
+            setTimeout(() => {
+                initBaselineFromRelay().catch(err => {
+                    console.error('[ST-Saver] initBaselineFromRelay error:', err);
+                });
+            }, 200);  // 等 200ms 让酒馆完成 chat 切换
         });
     }
 });
