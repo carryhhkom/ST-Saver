@@ -32,6 +32,13 @@ const defaultSettings = Object.freeze({
     relayEnabled: true,
     relayBaseUrl: 'http://127.0.0.1:9527',
     relayHealthcheckInterval: 30,    // 秒
+    // 每次 delta 请求超时（秒）。中转处理大聊天耗时取决于行数：
+    //   ~6MB / 1000 行  → 2-3 秒
+    //   ~30MB / 5000 行 → 5-8 秒
+    //   ~80MB / 1800 行 → 9-12 秒（特殊：每行很大）
+    //   ~200MB         → 25-30 秒
+    // 如果你聊天特别大（200MB+）或服务器配置低，调高这个数。
+    relayTimeoutSec: 60,
     relayDebugLog: false,
 });
 
@@ -112,10 +119,10 @@ function throttledToast(level, key, message, title = 'ST-Saver') {
 // 必须在任何 relayFetch 调用前抓取 native fetch，否则我们自己后面会包它
 const originalFetch = window.fetch;
 
-// 中转处理大聊天（46-78MB）需要时间：拉磁盘 + JSON parse + diff + stringify + 写磁盘
-// 8 秒只够中等聊天，大聊天会超时被误判为"中转挂了"。
-// 60 秒兼容超大聊天的同时仍能合理失败兜底。
-const RELAY_TIMEOUT_MS = 60_000;
+function getRelayTimeoutMs() {
+    const sec = parseInt(getSettings().relayTimeoutSec, 10);
+    return Math.max(5, Number.isFinite(sec) ? sec : 60) * 1000;
+}
 
 const relayState = {
     healthy: false,
@@ -128,7 +135,7 @@ const relayState = {
  * 中转自己持有酒馆 cookie + csrf，浏览器无需带任何认证。
  * credentials: 'omit' 显式不带 cookie，避免跨域 preflight 复杂化。
  */
-async function relayFetch(path, init = {}, timeoutMs = RELAY_TIMEOUT_MS) {
+async function relayFetch(path, init = {}, timeoutMs = getRelayTimeoutMs()) {
     const settings = getSettings();
     const base = settings.relayBaseUrl.replace(/\/+$/, '');
     const url = base + path;
@@ -820,6 +827,11 @@ function renderSettingsHtml() {
                 <div class="st_saver_hint" style="font-size: smaller; opacity: 0.8;">
                     远程访问时填中转所在服务器的 IP/域名:9527。中转和酒馆同机部署，自己持有 cookie+csrf，浏览器无需带任何认证。
                 </div>
+                <label for="st_saver_relay_timeout">单次请求超时（秒）</label>
+                <input type="number" id="st_saver_relay_timeout" value="${s.relayTimeoutSec}" min="5" max="600" class="text_pole">
+                <div class="st_saver_hint" style="font-size: smaller; opacity: 0.8;">
+                    中转处理一次保存的耗时取决于聊天大小。10-30MB 默认 60 秒足够；超大聊天（200MB+）调高到 120-300 秒。
+                </div>
                 <label class="checkbox_label">
                     <input type="checkbox" id="st_saver_relay_debug" ${s.relayDebugLog ? 'checked' : ''}>
                     <span>开启增量同步调试日志</span>
@@ -894,6 +906,11 @@ function bindSettingsEvents() {
         save();
         relayState.lastCheck = 0;
         refreshRelayStatusUi();
+    });
+    $(document).on('input', '#st_saver_relay_timeout', function () {
+        const v = parseInt($(this).val(), 10);
+        s().relayTimeoutSec = Math.max(5, Math.min(600, Number.isFinite(v) ? v : defaultSettings.relayTimeoutSec));
+        save();
     });
     $(document).on('change', '#st_saver_relay_debug', function () {
         s().relayDebugLog = $(this).prop('checked');
