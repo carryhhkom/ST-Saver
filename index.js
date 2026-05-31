@@ -88,6 +88,22 @@ function logRelay(...args) {
     if (getSettings().relayDebugLog) console.log('[ST-Saver][Relay]', ...args);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 节流 toast：同 key 30 秒内最多弹一次，避免连续失败刷屏
+// ─────────────────────────────────────────────────────────────────────
+const TOAST_DEDUP_MS = 30 * 1000;
+const lastToastAt = new Map();   // key → timestamp
+
+function throttledToast(level, key, message, title = 'ST-Saver') {
+    if (!window.toastr) return;
+    const now = Date.now();
+    const last = lastToastAt.get(key) || 0;
+    if (now - last < TOAST_DEDUP_MS) return;
+    lastToastAt.set(key, now);
+    const fn = window.toastr[level] || window.toastr.info;
+    fn(message, title);
+}
+
 
 // ─────────────────────────────────────────────────────────────────────
 // 中转客户端
@@ -418,6 +434,11 @@ async function handleIncrementalSave(url, init) {
     const ok = await checkRelayHealth(false);
     if (!ok) {
         logRelay('relay unhealthy, fallback to full save');
+        throttledToast(
+            'warning',
+            'relay_down',
+            '⚠ 中转服务不可达，本次保存走全量。请检查 st-save-relay 是否在跑。',
+        );
         return null;
     }
 
@@ -478,17 +499,22 @@ window.fetch = function (url, init) {
 
         return (async () => {
             // 先尝试增量
+            let incrementalFailReason = null;
             try {
                 const incremental = await handleIncrementalSave(urlString, init);
                 if (incremental) {
                     logRelay('auto save → incremental ok');
-                    if (isManual && window.toastr) {
-                        window.toastr.success('聊天保存成功（增量）', 'ST-Saver');
+                    if (isManual) {
+                        throttledToast('success', 'manual_inc_ok', '聊天保存成功（增量）');
                     }
                     return incremental;
                 }
+                // handleIncrementalSave 返回 null 但没抛错 = 内部决定走全量
+                // （比如：中转不健康 / 首次没基线 / changes 太多）
+                incrementalFailReason = 'fell_through';
             } catch (err) {
                 console.error('[ST-Saver] incremental save error, fallback to full:', err);
+                incrementalFailReason = err?.message || 'unknown';
             }
 
             // 增量失败 → 全量兜底
@@ -514,11 +540,19 @@ window.fetch = function (url, init) {
                         }
                     }
                 } catch (e) { logRelay('post-fallback baseline update failed:', e?.message); }
-                if (isManual && window.toastr) {
-                    window.toastr.success('聊天保存成功（全量兜底）', 'ST-Saver');
+
+                // 关键：明确告诉用户走了全量保存（流量大），不要让用户以为一切正常
+                if (isManual) {
+                    throttledToast('success', 'manual_full_ok', '聊天保存成功（全量兜底）');
                 }
+                // 即使是自动保存场景，也要告警一次：增量失败导致退化为全量上传
+                throttledToast(
+                    'warning',
+                    'fallback_active',
+                    `增量保存失败，已用全量兜底（流量较大）。原因：${incrementalFailReason || 'unknown'}。请检查中转服务。`,
+                );
             } else {
-                if (window.toastr) window.toastr.error(`聊天保存失败: ${resp.statusText}`, 'ST-Saver');
+                throttledToast('error', 'save_failed', `聊天保存失败: ${resp.statusText}`);
             }
             return resp;
         })();
