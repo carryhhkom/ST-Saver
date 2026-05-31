@@ -15,7 +15,6 @@ import {
     this_chid,
     eventSource,
     event_types,
-    getRequestHeaders,
     getCurrentChatId,
 } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
@@ -28,11 +27,10 @@ const defaultSettings = Object.freeze({
     allowInterval: 10,
 
     // 增量同步开关与中转地址
-    // 默认相对路径：要求酒馆前面有反向代理把 /relay/* 转发到中转
-    // （HttpOnly session cookie 必须同源才能被浏览器自动带上）
-    // 直连场景请改为 http://127.0.0.1:9527 并保证酒馆禁用 CSRF（不推荐）
+    // 中转自己持有酒馆 cookie + csrf，浏览器请求中转时无需带任何认证。
+    // 默认填本机 9527；远程访问时改成中转的 IP/域名:端口。
     relayEnabled: true,
-    relayBaseUrl: '/relay',
+    relayBaseUrl: 'http://127.0.0.1:9527',
     relayHealthcheckInterval: 30,    // 秒
     relayDebugLog: false,
 });
@@ -108,9 +106,8 @@ const relayState = {
 /**
  * 包装 fetch，加超时控制；用 originalFetch 跳过我们自己的拦截器。
  *
- * credentials: 'include' 让浏览器自动把酒馆域的 cookie 带给中转。
- * 由于 session cookie 是 HttpOnly，扩展无法手动转发，
- * 必须依赖反向代理把 /relay/* 路由到中转保证同源。
+ * 中转自己持有酒馆 cookie + csrf，浏览器无需带任何认证。
+ * credentials: 'omit' 显式不带 cookie，避免跨域 preflight 复杂化。
  */
 async function relayFetch(path, init = {}, timeoutMs = RELAY_TIMEOUT_MS) {
     const settings = getSettings();
@@ -122,7 +119,7 @@ async function relayFetch(path, init = {}, timeoutMs = RELAY_TIMEOUT_MS) {
         return await originalFetch(url, {
             ...init,
             signal: controller.signal,
-            credentials: 'include',
+            credentials: 'omit',
         });
     } finally {
         clearTimeout(timer);
@@ -151,33 +148,15 @@ async function checkRelayHealth(force = false) {
 }
 
 /**
- * 构造发给中转的请求头：
- *   - cookie 由浏览器在同源请求中自动带（HttpOnly）
- *   - X-CSRF-Token 必须我们手动塞进去，从酒馆原始 saveChat 请求里抠出来
+ * 构造发给中转的请求头。
  *
- * 中转再把这两样原样转发给酒馆，从而过 csrf 校验。
+ * 中转自己持有酒馆 cookie + csrf（启动时调 GET /csrf-token 取得），
+ * 浏览器/扩展无需透传任何认证信息，简单干净。
+ *
+ * @param {*} _originalHeaders  保留参数槽位以备后续用，当前忽略
  */
-function buildForwardHeaders(originalHeaders) {
-    const out = { 'Content-Type': 'application/json' };
-
-    // 1. 优先用 saveChat 调用时的 headers（含 csrf token）
-    let src = originalHeaders;
-
-    // 2. 拿不到就用 getRequestHeaders() 现取（酒馆运行时的全局 token）
-    if (!src) {
-        try { src = getRequestHeaders(); } catch (e) { /* 极个别启动期可能拿不到 */ }
-    }
-
-    if (src) {
-        let csrf;
-        if (typeof src.get === 'function') {
-            csrf = src.get('X-CSRF-Token') || src.get('x-csrf-token');
-        } else {
-            csrf = src['X-CSRF-Token'] ?? src['x-csrf-token'];
-        }
-        if (csrf) out['X-CSRF-Token'] = csrf;
-    }
-    return out;
+function buildForwardHeaders(_originalHeaders) {
+    return { 'Content-Type': 'application/json' };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -661,7 +640,10 @@ function renderSettingsHtml() {
                     远程流量从全量 (5-46MB) 降至 KB 级。中转不可用时自动退化到原版全量保存。
                 </div>
                 <label for="st_saver_relay_url">中转地址</label>
-                <input type="text" id="st_saver_relay_url" value="${s.relayBaseUrl}" class="text_pole" placeholder="http://127.0.0.1:9527">
+                <input type="text" id="st_saver_relay_url" value="${s.relayBaseUrl}" class="text_pole" placeholder="http://192.168.x.x:9527">
+                <div class="st_saver_hint" style="font-size: smaller; opacity: 0.8;">
+                    远程访问时填中转所在服务器的 IP/域名:9527。中转和酒馆同机部署，自己持有 cookie+csrf，浏览器无需带任何认证。
+                </div>
                 <label class="checkbox_label">
                     <input type="checkbox" id="st_saver_relay_debug" ${s.relayDebugLog ? 'checked' : ''}>
                     <span>开启增量同步调试日志</span>
