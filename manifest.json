@@ -1,0 +1,11 @@
+{
+  "display_name": "ST-Saver (增量同步版)",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "author": "carryhhkom",
+  "version": "1.0.0",
+  "homePage": "https://github.com/carryhhkom/ST-Saver",
+  "auto_update": true
+}
