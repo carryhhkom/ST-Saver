@@ -458,6 +458,58 @@ window.fetch = function (url, init) {
         return originalFetch.apply(this, arguments);
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // 模式 1：增量同步开启 → 每次 saveChat 都直接走增量（不再屏蔽）
+    //
+    // 增量保存本身就是 KB 级流量，没必要再"攒批 + 定时放行"。
+    // 失败自动回退到原版全量。
+    // ────────────────────────────────────────────────────────────────
+    if (settings.relayEnabled) {
+        return (async () => {
+            // 先尝试增量
+            try {
+                const incremental = await handleIncrementalSave(urlString, init);
+                if (incremental) {
+                    logRelay('auto save → incremental ok');
+                    return incremental;
+                }
+            } catch (err) {
+                console.error('[ST-Saver] incremental save error, fallback to full:', err);
+            }
+
+            // 增量失败 → 全量兜底
+            const resp = await originalFetch.call(window, url, init);
+            if (resp.ok) {
+                // 用本次 chat 重建基线，保证下次增量是准的
+                try {
+                    const parsed = extractChatToSaveFromRequest(urlString, init);
+                    if (parsed) {
+                        const resolved = resolveCurrentIdentity();
+                        if (resolved) {
+                            const sessionKey = buildSessionKey(resolved.kind, resolved.identity);
+                            const hashes = computeChatHashes(parsed.chat);
+                            currentSession = {
+                                sessionKey,
+                                kind: resolved.kind,
+                                identity: resolved.identity,
+                                lastSyncedHashes: hashes,
+                                baselineFingerprint: fingerprintHashes(hashes),
+                                inited: true,
+                            };
+                            logRelay('baseline updated after full save fallback', sessionKey, 'len=', hashes.length);
+                        }
+                    }
+                } catch (e) { logRelay('post-fallback baseline update failed:', e?.message); }
+            } else {
+                if (window.toastr) window.toastr.error(`聊天保存失败: ${resp.statusText}`, 'ST-Saver');
+            }
+            return resp;
+        })();
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 模式 2：增量同步关闭 → 走原版"屏蔽 + 手动按钮 / 定时放行 + 全量"逻辑
+    // ────────────────────────────────────────────────────────────────
     const saveIntent = consumeSaveIntent();
 
     // 没有"放行意图" → 屏蔽这次自动保存（manual saver 原本行为）
@@ -557,6 +609,8 @@ function scheduleTimedSave(delayMs = getTimedSaveIntervalMs()) {
     clearTimedSaveTimer();
     const settings = getSettings();
     if (!settings.enabled || !settings.allowTimedSave) return;
+    // 增量同步开启时，每次 saveChat 都即时放行了，定时器没意义
+    if (settings.relayEnabled) return;
     timedSaveTimer = setTimeout(() => triggerTimedSave(), Math.max(1000, delayMs));
 }
 
@@ -620,12 +674,17 @@ function renderSettingsHtml() {
                 </label>
                 <div class="st_saver_hint" style="font-size: smaller; opacity: 0.8;">启用后，SillyTavern的自动保存将被屏蔽，仅在手动保存或定时放行时上传。</div>
 
-                <fieldset id="st_saver_timed_options" ${!s.enabled ? 'disabled' : ''}>
+                <fieldset id="st_saver_timed_options" ${(!s.enabled || s.relayEnabled) ? 'disabled' : ''}>
                     <hr>
                     <label class="checkbox_label">
                         <input type="checkbox" id="st_saver_allow_timed_save" ${s.allowTimedSave ? 'checked' : ''}>
                         <span>启用定时允许自动保存</span>
                     </label>
+                    <div class="st_saver_hint" style="font-size: smaller; opacity: 0.8;">
+                        ${s.relayEnabled
+                            ? '（增量同步已启用，每次保存都走增量，无需定时放行）'
+                            : '每隔一段时间放行一次自动保存，避免忘记手动保存导致大量丢失'}
+                    </div>
                     <label for="st_saver_allow_interval">间隔时间（分钟）</label>
                     <input type="number" id="st_saver_allow_interval" value="${s.allowInterval}" min="1" class="text_pole">
                 </fieldset>
@@ -702,6 +761,15 @@ function bindSettingsEvents() {
     $(document).on('change', '#st_saver_relay_enabled', function () {
         s().relayEnabled = $(this).prop('checked');
         save();
+        // 增量开启 → 关掉定时；关闭 → 恢复定时
+        if (s().relayEnabled) {
+            clearTimedSaveTimer();
+        } else {
+            resetTimer('relay disabled, timer back');
+        }
+        // 重新渲染设置面板让 fieldset disabled 状态正确
+        const $container = $('#st_saver_container');
+        if ($container.length) $container.html(renderSettingsHtml());
         refreshRelayStatusUi();
     });
     $(document).on('change', '#st_saver_relay_url', function () {
