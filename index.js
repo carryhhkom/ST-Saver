@@ -463,14 +463,28 @@ window.fetch = function (url, init) {
     //
     // 增量保存本身就是 KB 级流量，没必要再"攒批 + 定时放行"。
     // 失败自动回退到原版全量。
+    //
+    // toast 策略：
+    //   - 自动保存（无 manual intent）：成功静默，仅失败弹
+    //   - 手动按钮触发（有 manual intent）：成功也弹（用户主动需反馈）
     // ────────────────────────────────────────────────────────────────
     if (settings.relayEnabled) {
+        // 偷看一下 intent 是不是 manual（不消费），决定 toast 策略
+        const peekedIntent = pendingSaveIntent;
+        const isManual = peekedIntent && peekedIntent.type === 'manual'
+            && Date.now() <= peekedIntent.expiresAt;
+        // 消费 intent（避免它泄漏给后续请求）
+        consumeSaveIntent();
+
         return (async () => {
             // 先尝试增量
             try {
                 const incremental = await handleIncrementalSave(urlString, init);
                 if (incremental) {
                     logRelay('auto save → incremental ok');
+                    if (isManual && window.toastr) {
+                        window.toastr.success('聊天保存成功（增量）', 'ST-Saver');
+                    }
                     return incremental;
                 }
             } catch (err) {
@@ -500,6 +514,9 @@ window.fetch = function (url, init) {
                         }
                     }
                 } catch (e) { logRelay('post-fallback baseline update failed:', e?.message); }
+                if (isManual && window.toastr) {
+                    window.toastr.success('聊天保存成功（全量兜底）', 'ST-Saver');
+                }
             } else {
                 if (window.toastr) window.toastr.error(`聊天保存失败: ${resp.statusText}`, 'ST-Saver');
             }
