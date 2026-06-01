@@ -107,6 +107,23 @@ function logRelay(...args) {
 let settingsBaseline = null;
 
 /**
+ * settings 保存串行锁：settings 保存很频繁，若并发会基于旧基线算 patch，
+ * 导致中转频繁 409 + 全量重发。用 promise 链强制串行。
+ */
+/** @type {Promise<any>} */
+let settingsSaveTail = Promise.resolve();
+/**
+ * @param {() => Promise<any>} fn
+ * @returns {Promise<any>}
+ */
+function runSettingsSerial(fn) {
+    const next = settingsSaveTail.then(fn, fn);
+    // 失败也要释放队列，不传染
+    settingsSaveTail = next.catch(() => undefined);
+    return next;
+}
+
+/**
  * 稳定序列化（key 排序），跟中转 settings-store.js 的 stableStringify 一致。
  * 保证两端 fingerprint 算法相同。
  */
@@ -747,7 +764,8 @@ window.fetch = function (url, init) {
     if (isSettingsSave && settings.relayEnabled) {
         return (async () => {
             try {
-                const handled = await handleSettingsSave(urlString, init);
+                // 串行化：避免并发 saveSettings 基于旧基线算 patch
+                const handled = await runSettingsSerial(() => handleSettingsSave(urlString, init));
                 if (handled) {
                     logRelay('settings save → incremental ok');
                     return handled;
@@ -758,17 +776,10 @@ window.fetch = function (url, init) {
             // 回退原版全量
             const resp = await originalFetch.call(window, url, init);
             if (resp.ok) {
-                // 全量成功 → 重建 settings 基线
-                try {
-                    if (init?.body && typeof init.body === 'string') {
-                        const obj = JSON.parse(init.body);
-                        settingsBaseline = {
-                            snapshot: obj,
-                            fingerprint: settingsFingerprint(obj),
-                        };
-                        logRelay('settings: baseline rebuilt after full save');
-                    }
-                } catch (e) { /* ignore */ }
+                // 全量成功（绕过了中转，中转内存基线已过期）→
+                // 把扩展基线置 null，强制下次保存走 full 主动与中转重新对齐
+                settingsBaseline = null;
+                logRelay('settings: full fallback ok, baseline reset (next save will re-sync)');
                 throttledToast('warning', 'settings_fallback',
                     '设置增量同步失败，已用全量兜底（流量较大）。请检查中转服务。');
             } else {
