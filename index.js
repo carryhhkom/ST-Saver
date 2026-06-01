@@ -809,6 +809,40 @@ async function handleIncrementalSave(url, init) {
             return null;
         }
     }
+
+    // ★ 统一骤降保护（pre-delta）：用当前基线（上次已知的磁盘真相）挡住坍缩，
+    // 无论中转健康与否都先拦。这样即使下面健康检查失败走全量兜底，
+    // 也不会让坍缩的 chat 经 originalFetch 直接覆盖磁盘。
+    {
+        const guard = checkShrinkGuard(currentSession.lastSyncedHashes.length, chatToSave.length);
+        if (guard.blocked) {
+            logRelay(`⛔ shrink guard (pre-delta): base=${guard.baseLength} new=${guard.newLength}, BLOCK`);
+            throttledToast(
+                'error',
+                'shrink_guard',
+                `⛔ 检测到聊天异常变短（${guard.baseLength}→${guard.newLength} 条），已拦截本次保存以保护磁盘记录。`
+                + `请刷新页面确认聊天完整后再继续。`,
+                'ST-Saver 数据保护',
+            );
+            currentSession = null; // 作废，下次重新对齐
+            return new Response(JSON.stringify({ result: 'ok', guarded: true }), {
+                status: 200, headers: { 'Content-Type': 'application/json' },
+            });
+        }
+    }
+
+    // 健康检查（轻量缓存）：不健康则快速回退全量（带 toast），避免 postDelta 空等到超时
+    const ok = await checkRelayHealth(false);
+    if (!ok) {
+        logRelay('relay unhealthy, fallback to full save');
+        throttledToast(
+            'warning',
+            'relay_down',
+            '⚠ 中转服务不可达，本次保存走全量。请检查 st-save-relay 是否在跑。',
+        );
+        return null;
+    }
+
     const result = await postDelta(init?.headers, chatToSave);
     if (result.ok) {
         // 增量成功，伪造一个 200 响应让酒馆继续
