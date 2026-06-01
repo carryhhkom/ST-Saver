@@ -40,6 +40,14 @@ const defaultSettings = Object.freeze({
     // 如果你聊天特别大（200MB+）或服务器配置低，调高这个数。
     relayTimeoutSec: 60,
     relayDebugLog: false,
+
+    // ★ 数据丢失保护（防止坍缩的内存聊天覆盖磁盘完整记录）
+    // 当本次要保存的聊天行数 < 基线(磁盘真相)行数 × shrinkGuardRatio 时，
+    // 判定为"异常骤降"，直接阻止保存（丢弃坏数据，磁盘保持原样）。
+    // 基线行数 < shrinkGuardMinBase 时不启用（避免新聊天误伤）。
+    // 把 shrinkGuardRatio 设为 0 可关闭保护。需要一次性大量删除消息时临时调低。
+    shrinkGuardRatio: 0.5,
+    shrinkGuardMinBase: 20,
 });
 
 function getSettings() {
@@ -413,6 +421,37 @@ function rebuildBaselineFromRelay(payload) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 数据丢失保护：检测聊天行数异常骤降
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 判断"新聊天行数"相对"磁盘基线行数"是否异常骤降。
+ * 骤降通常意味着内存里的 chat 没加载完整（页面重载竞态 / 脚本异常坍缩），
+ * 此时绝不能让它覆盖磁盘上的完整记录。
+ *
+ * @param {number} baseLength  基线（磁盘真相）行数
+ * @param {number} newLength   本次要保存的行数
+ * @returns {{ blocked: boolean, baseLength: number, newLength: number, ratio: number }}
+ */
+function checkShrinkGuard(baseLength, newLength) {
+    const cfg = getSettings();
+    const ratioThreshold = Number(cfg.shrinkGuardRatio);
+    const minBase = Number(cfg.shrinkGuardMinBase);
+    const result = { blocked: false, baseLength, newLength, ratio: ratioThreshold };
+
+    // 关闭保护
+    if (!Number.isFinite(ratioThreshold) || ratioThreshold <= 0) return result;
+    // 基线太小（新聊天 / 刚开局）不启用，避免误伤正常增长
+    if (!Number.isFinite(baseLength) || baseLength < (Number.isFinite(minBase) ? minBase : 20)) return result;
+
+    // 新行数 < 基线 × 阈值 → 判定骤降
+    if (newLength < baseLength * ratioThreshold) {
+        result.blocked = true;
+    }
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // diff 计算
 // ─────────────────────────────────────────────────────────────────────
 
@@ -440,7 +479,7 @@ function computeDelta(oldHashes, newChat) {
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * @returns {Promise<{ ok: true } | { ok: false, reason: string }>}
+ * @returns {Promise<{ ok: true } | { ok: false, reason: string, shrink?: { baseLength: number, newLength: number } }>}
  */
 async function postDelta(originalHeaders, chatToSave) {
     if (!currentSession || !currentSession.inited) {
@@ -449,6 +488,15 @@ async function postDelta(originalHeaders, chatToSave) {
 
     const session = currentSession;
     const delta = computeDelta(session.lastSyncedHashes, chatToSave);
+
+    // ★ 数据丢失保护：行数异常骤降 → 拒绝保存
+    // 场景：手机端页面重载竞态，内存 chat 坍缩成几行，若放行会把磁盘几十 MB 覆盖成几 B。
+    // 这里 oldLength = 上次同步的磁盘真相行数，newLength = 本次内存行数。
+    const guard = checkShrinkGuard(delta.oldLength, delta.newLength);
+    if (guard.blocked) {
+        logRelay(`⛔ shrink guard: base=${delta.oldLength} new=${delta.newLength}, BLOCK to protect disk`);
+        return { ok: false, reason: 'shrink_guard', shrink: guard };
+    }
 
     // 没有任何变化
     if (delta.changes.length === 0 && delta.oldLength === delta.newLength) {
@@ -496,6 +544,15 @@ async function postDelta(originalHeaders, chatToSave) {
     // 409 = 基线过期，中转返回了真实磁盘 hashes
     if (res.status === 409) {
         const json = await res.json().catch(() => null);
+        // ★ 中转的骤降保护 409：这是数据保护信号，绝不能 rebuild+retry 或走全量
+        if (json && json.error === 'shrink_guard') {
+            logRelay(`⛔ relay shrink guard 409: disk=${json.length} → BLOCK, protect disk`);
+            return {
+                ok: false,
+                reason: 'shrink_guard',
+                shrink: { baseLength: json.length, newLength: delta.newLength },
+            };
+        }
         if (json && Array.isArray(json.hashes)) {
             rebuildBaselineFromRelay(json);
             // 用纠正后的基线重新算并重发一次（仅一次重试，避免无限循环）
@@ -690,42 +747,93 @@ async function handleIncrementalSave(url, init) {
 
     const chatToSave = parsedBody.chat;
 
-    // 没有基线 → 第一次拦截到 → 用 saveChat 自带的 chat 直接建基线，并走全量保存
-    // （这是最安全的初始化路径：本次保存照常走全量，下一次开始才走增量）
+    // 没有基线 → 第一次拦截到。
+    // ★ 不能盲目用内存 chat 建基线后走全量（手机端这正是坍缩窗口，会覆盖磁盘）。
+    // 先尝试从中转拉磁盘真相，用磁盘行数对内存行数做骤降保护：
+    //   - 拉到磁盘基线且行数正常 → 用磁盘基线，继续走增量（不全量覆盖）
+    //   - 拉到磁盘基线但内存骤降 → 拦截，保护磁盘
+    //   - 中转不可达 → 保持原行为（用内存建基线 + 全量），无磁盘真相时无法保护
     if (!currentSession || !currentSession.inited) {
         const resolved = resolveCurrentIdentity();
         if (!resolved) return null;
-        const sessionKey = buildSessionKey(resolved.kind, resolved.identity);
-        const hashes = computeChatHashes(chatToSave);
-        const fp = fingerprintHashes(hashes);
-        currentSession = {
-            sessionKey,
-            kind: resolved.kind,
-            identity: resolved.identity,
-            lastSyncedHashes: hashes,
-            baselineFingerprint: fp,
-            inited: true,
-        };
-        logRelay('first save: baseline initialized in-place, fall through to full save');
-        return null; // 走全量
-    }
 
-    // 健康检查（轻量缓存）
-    const ok = await checkRelayHealth(false);
-    if (!ok) {
-        logRelay('relay unhealthy, fallback to full save');
-        throttledToast(
-            'warning',
-            'relay_down',
-            '⚠ 中转服务不可达，本次保存走全量。请检查 st-save-relay 是否在跑。',
-        );
-        return null;
+        const healthy = await checkRelayHealth(false);
+        if (healthy) {
+            const based = await initBaselineFromRelay();
+            if (based && based.inited) {
+                // 用磁盘真相做骤降保护
+                const guard = checkShrinkGuard(based.lastSyncedHashes.length, chatToSave.length);
+                if (guard.blocked) {
+                    logRelay(`⛔ first-save shrink guard: disk=${guard.baseLength} new=${guard.newLength}, BLOCK`);
+                    throttledToast(
+                        'error',
+                        'shrink_guard',
+                        `⛔ 检测到聊天异常变短（${guard.baseLength}→${guard.newLength} 条），已拦截本次保存以保护磁盘记录。`
+                        + `请刷新页面确认聊天完整后再继续。`,
+                        'ST-Saver 数据保护',
+                    );
+                    currentSession = null; // 作废，下次重新对齐
+                    return new Response(JSON.stringify({ result: 'ok', guarded: true }), {
+                        status: 200, headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                // 行数正常 → 直接走下面的增量路径（已有 currentSession=磁盘基线）
+            } else {
+                // 拉基线失败 → 用内存建基线 + 全量兜底（无磁盘真相，保持原行为）
+                const sessionKey = buildSessionKey(resolved.kind, resolved.identity);
+                const hashes = computeChatHashes(chatToSave);
+                currentSession = {
+                    sessionKey,
+                    kind: resolved.kind,
+                    identity: resolved.identity,
+                    lastSyncedHashes: hashes,
+                    baselineFingerprint: fingerprintHashes(hashes),
+                    inited: true,
+                };
+                logRelay('first save: relay init failed, in-place baseline, fall through to full save');
+                return null;
+            }
+        } else {
+            // 中转不可达 → 原行为
+            const sessionKey = buildSessionKey(resolved.kind, resolved.identity);
+            const hashes = computeChatHashes(chatToSave);
+            currentSession = {
+                sessionKey,
+                kind: resolved.kind,
+                identity: resolved.identity,
+                lastSyncedHashes: hashes,
+                baselineFingerprint: fingerprintHashes(hashes),
+                inited: true,
+            };
+            logRelay('first save: relay unhealthy, in-place baseline, fall through to full save');
+            return null;
+        }
     }
-
     const result = await postDelta(init?.headers, chatToSave);
     if (result.ok) {
         // 增量成功，伪造一个 200 响应让酒馆继续
         return new Response(JSON.stringify({ result: 'ok' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    // ★ 数据丢失保护命中：绝不能走全量兜底（全量会用坍缩的 chat 覆盖磁盘）
+    // 这里直接伪造一个 200 让酒馆以为存好了（磁盘其实保持完整），并强力告警。
+    // 同时让基线作废，下次保存重新从磁盘拉真相对齐。
+    if (result.reason === 'shrink_guard') {
+        const s = result.shrink || { baseLength: '?', newLength: '?' };
+        logRelay(`⛔ shrink guard active: discarded collapsed save (base=${s.baseLength} new=${s.newLength}), disk protected`);
+        throttledToast(
+            'error',
+            'shrink_guard',
+            `⛔ 检测到聊天异常变短（${s.baseLength}→${s.newLength} 条），已拦截本次保存以保护磁盘记录。`
+            + `请刷新页面确认聊天完整后再继续。`,
+            'ST-Saver 数据保护',
+        );
+        // 基线作废：下次 saveChat 会重新拉磁盘真相
+        currentSession = null;
+        return new Response(JSON.stringify({ result: 'ok', guarded: true }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
         });
