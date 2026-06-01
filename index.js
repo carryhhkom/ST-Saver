@@ -96,6 +96,84 @@ function logRelay(...args) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// settings 增量同步状态
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 上次成功同步给中转的 settings 基线：
+ *   { snapshot: 深拷贝的 settings 对象, fingerprint: string }
+ * 用于算 field-level patch。
+ */
+let settingsBaseline = null;
+
+/**
+ * 稳定序列化（key 排序），跟中转 settings-store.js 的 stableStringify 一致。
+ * 保证两端 fingerprint 算法相同。
+ */
+function stableStringify(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+    const keys = Object.keys(value).sort();
+    return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+function settingsFingerprint(obj) {
+    return cyrb53(stableStringify(obj));
+}
+
+/**
+ * 算 settings 的字段级 patch（顶层 key + extension_settings 二级 key）。
+ * 大部分 key 不变（比如 tavern_helper 那 6MB），只传变化的。
+ *
+ * @returns {{ patch, changedBytes, isTrivial } | null}
+ *   null 表示无法增量（应走全量）
+ */
+function computeSettingsPatch(oldObj, newObj) {
+    /** @type {{ top: Record<string,any>, ext: Record<string,any>, topRemoved: string[], extRemoved: string[] }} */
+    const patch = { top: {}, ext: {}, topRemoved: [], extRemoved: [] };
+
+    const oldKeys = new Set(Object.keys(oldObj));
+    const newKeys = new Set(Object.keys(newObj));
+
+    // 顶层字段对比（除 extension_settings 单独处理）
+    for (const k of newKeys) {
+        if (k === 'extension_settings') continue;
+        if (!oldKeys.has(k) || stableStringify(oldObj[k]) !== stableStringify(newObj[k])) {
+            patch.top[k] = newObj[k];
+        }
+    }
+    for (const k of oldKeys) {
+        if (k === 'extension_settings') continue;
+        if (!newKeys.has(k)) patch.topRemoved.push(k);
+    }
+
+    // extension_settings 二级对比
+    const oldExt = (oldObj.extension_settings && typeof oldObj.extension_settings === 'object') ? oldObj.extension_settings : {};
+    const newExt = (newObj.extension_settings && typeof newObj.extension_settings === 'object') ? newObj.extension_settings : {};
+    const oldExtKeys = new Set(Object.keys(oldExt));
+    const newExtKeys = new Set(Object.keys(newExt));
+    for (const k of newExtKeys) {
+        if (!oldExtKeys.has(k) || stableStringify(oldExt[k]) !== stableStringify(newExt[k])) {
+            patch.ext[k] = newExt[k];
+        }
+    }
+    for (const k of oldExtKeys) {
+        if (!newExtKeys.has(k)) patch.extRemoved.push(k);
+    }
+
+    const changedBytes = (() => {
+        try { return new TextEncoder().encode(JSON.stringify(patch)).length; } catch { return 0; }
+    })();
+
+    const noChange = Object.keys(patch.top).length === 0
+        && Object.keys(patch.ext).length === 0
+        && patch.topRemoved.length === 0
+        && patch.extRemoved.length === 0;
+
+    return { patch, changedBytes, isTrivial: noChange };
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 节流 toast：同 key 30 秒内最多弹一次，避免连续失败刷屏
 // ─────────────────────────────────────────────────────────────────────
 const TOAST_DEDUP_MS = 30 * 1000;
@@ -471,6 +549,118 @@ function extractChatToSaveFromRequest(url, init) {
 }
 
 /**
+ * 用增量同步处理 saveSettings（/api/settings/save）。
+ * 把整个 settings 对象 diff 成字段级 patch 发给中转。
+ * 成功返回 Response，失败返回 null（外层走原版全量）。
+ */
+async function handleSettingsSave(url, init) {
+    const cfg = getSettings();
+    if (!cfg.relayEnabled) return null;
+
+    // 取出本次要保存的完整 settings 对象
+    let newSettings;
+    try {
+        if (!init?.body || typeof init.body !== 'string') return null;
+        newSettings = JSON.parse(init.body);
+        if (!newSettings || typeof newSettings !== 'object') return null;
+    } catch (e) {
+        logRelay('settings: parse body failed:', e?.message);
+        return null;
+    }
+
+    const ok = await checkRelayHealth(false);
+    if (!ok) {
+        logRelay('settings: relay unhealthy, fallback to full');
+        return null;
+    }
+
+    const newFp = settingsFingerprint(newSettings);
+
+    // 没有基线 → 走全量 full（建立基线）
+    if (!settingsBaseline) {
+        try {
+            const res = await relayFetch('/sync/settings/full', {
+                method: 'POST',
+                headers: buildForwardHeaders(),
+                body: JSON.stringify({ settings: newSettings }),
+            });
+            if (res.ok) {
+                const json = await res.json().catch(() => ({}));
+                settingsBaseline = {
+                    snapshot: JSON.parse(JSON.stringify(newSettings)),
+                    fingerprint: json.baselineFingerprint || newFp,
+                };
+                logRelay('settings: full sync established baseline, fp=', settingsBaseline.fingerprint);
+                return new Response(JSON.stringify({ result: 'ok' }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            }
+        } catch (e) {
+            logRelay('settings: full sync failed:', e?.message);
+        }
+        return null;
+    }
+
+    // 有基线 → 算 patch
+    const diff = computeSettingsPatch(settingsBaseline.snapshot, newSettings);
+    if (!diff) return null;
+    if (diff.isTrivial) {
+        logRelay('settings: no changes, skip');
+        return new Response(JSON.stringify({ result: 'ok' }), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    try {
+        const res = await relayFetch('/sync/settings/delta', {
+            method: 'POST',
+            headers: buildForwardHeaders(),
+            body: JSON.stringify({
+                baseFingerprint: settingsBaseline.fingerprint,
+                patch: diff.patch,
+            }),
+        });
+
+        if (res.ok) {
+            const json = await res.json().catch(() => ({}));
+            settingsBaseline = {
+                snapshot: JSON.parse(JSON.stringify(newSettings)),
+                fingerprint: json.baselineFingerprint || newFp,
+            };
+            logRelay(`settings: delta ok changedBytes=${diff.changedBytes} fp=${settingsBaseline.fingerprint}`);
+            return new Response(JSON.stringify({ result: 'ok' }), {
+                status: 200, headers: { 'Content-Type': 'application/json' },
+            });
+        }
+
+        // 409：中转基线过期（中转重启/多端）→ 重发完整
+        if (res.status === 409) {
+            logRelay('settings: 409, re-establishing baseline via full sync');
+            settingsBaseline = null;
+            const res2 = await relayFetch('/sync/settings/full', {
+                method: 'POST',
+                headers: buildForwardHeaders(),
+                body: JSON.stringify({ settings: newSettings }),
+            });
+            if (res2.ok) {
+                const j2 = await res2.json().catch(() => ({}));
+                settingsBaseline = {
+                    snapshot: JSON.parse(JSON.stringify(newSettings)),
+                    fingerprint: j2.baselineFingerprint || newFp,
+                };
+                logRelay('settings: re-sync ok, fp=', settingsBaseline.fingerprint);
+                return new Response(JSON.stringify({ result: 'ok' }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            }
+        }
+    } catch (e) {
+        logRelay('settings: delta failed:', e?.message);
+    }
+    return null;
+}
+
+/**
  * 用增量同步处理 saveChat。
  * 失败时返回 null，让外层走原版全量。
  */
@@ -547,6 +737,46 @@ window.fetch = function (url, init) {
     const urlString = url.toString();
     const isSoloSave = urlString.includes('/api/chats/save');
     const isGroupSave = urlString.includes('/api/chats/group/save');
+    const isSettingsSave = urlString.includes('/api/settings/save');
+
+    // ────────────────────────────────────────────────────────────────
+    // settings 增量同步：拦截 /api/settings/save
+    // settings 文件常被撑到几 MB（脚本库/正则等），且保存极频繁。
+    // 增量后单次从 ~9MB 降到 KB。失败回退原版全量。
+    // ────────────────────────────────────────────────────────────────
+    if (isSettingsSave && settings.relayEnabled) {
+        return (async () => {
+            try {
+                const handled = await handleSettingsSave(urlString, init);
+                if (handled) {
+                    logRelay('settings save → incremental ok');
+                    return handled;
+                }
+            } catch (err) {
+                console.error('[ST-Saver] settings incremental error, fallback to full:', err);
+            }
+            // 回退原版全量
+            const resp = await originalFetch.call(window, url, init);
+            if (resp.ok) {
+                // 全量成功 → 重建 settings 基线
+                try {
+                    if (init?.body && typeof init.body === 'string') {
+                        const obj = JSON.parse(init.body);
+                        settingsBaseline = {
+                            snapshot: obj,
+                            fingerprint: settingsFingerprint(obj),
+                        };
+                        logRelay('settings: baseline rebuilt after full save');
+                    }
+                } catch (e) { /* ignore */ }
+                throttledToast('warning', 'settings_fallback',
+                    '设置增量同步失败，已用全量兜底（流量较大）。请检查中转服务。');
+            } else {
+                throttledToast('error', 'settings_save_failed', `设置保存失败: ${resp.statusText}`);
+            }
+            return resp;
+        })();
+    }
 
     if (!isSoloSave && !isGroupSave) {
         return originalFetch.apply(this, arguments);
